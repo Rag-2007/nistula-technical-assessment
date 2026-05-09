@@ -132,6 +132,8 @@ The system uses strict contextual framing. The prompt injects the property's sta
 }
 ```
 
+---
+
 ## 6. Validation & Error Handling
 
 The system uses `class-validator` DTO validation to ensure all inbound webhook payloads are structurally correct before processing.
