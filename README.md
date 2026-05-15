@@ -192,12 +192,13 @@ nistula-technical-assessment/
 
 ## 4. Query Classification Logic
 
-A **weighted multi-signal scoring system** — not brittle first-match string checking.
+Instead of relying on brittle, exact-match string comparisons, the system uses a **weighted multi-signal scoring algorithm** to accurately determine guest intent.
 
-1. Every intent category (`PRE_SALES_AVAILABILITY`, `COMPLAINT`, `SPECIAL_REQUEST`, etc.) has a dictionary of terms with assigned weights.
-2. The system scans the message text (lowercased), sums matching weights for all categories.
-3. The category with the **highest cumulative score** wins.
-4. **Tie-breaking:** `COMPLAINT` always wins to ensure urgent issues are never missed.
+**How the logic evaluates messages:**
+1. **Keyword Weighting:** Each intent category (e.g., `COMPLAINT`, `PRE_SALES_PRICING`) is mapped to a dictionary of trigger words. Every word is assigned a numerical weight based on its significance (e.g., "broken" = 7 pts, "refund" = 8 pts).
+2. **Cumulative Scoring:** The system parses the inbound message and tallies up the score for every matched keyword across all categories simultaneously.
+3. **Classification Selection:** The category that accumulates the highest total score is declared the winner.
+4. **Safety Tie-Breaker:** If two categories end up with the exact same score, the system automatically defaults to `COMPLAINT`. This guarantees that potentially urgent issues are never missed or misclassified as general inquiries.
 
 ---
 
@@ -285,20 +286,3 @@ The `AiService` uses **`claude-sonnet-4-20250514`** (Anthropic SDK).
 
 ---
 
-## 9. Endpoints
-
-| Method | Path | Description | Auth |
-|---|---|---|---|
-| `POST` | `/webhook/message` | Process a guest message | None (rate limited) |
-| `GET` | `/webhook/health` | Health check for load balancer | None (throttle exempt) |
-
----
-
-## 10. Environment Variables
-
-| Variable | Required | Description |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | ✅ Yes | Your Anthropic API key for Claude access |
-| `PORT` | ❌ No | Port for the NestJS server (default: `3000`) |
-
-For Docker deployments, these are read from the `.env` file in the project root by `docker compose`.
