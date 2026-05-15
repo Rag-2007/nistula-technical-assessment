@@ -1,26 +1,44 @@
 # Nistula Guest Messaging Webhook
 
-A robust, production-grade NestJS backend designed to handle inbound guest messages across multiple channels (WhatsApp, Airbnb, Instagram, Booking.com, Direct). The system normalises messages into a unified schema, performs intelligent intent classification, delegates reply generation to Claude (Anthropic AI), and returns the drafted response alongside a calculated confidence score.
+A robust, production-grade **NestJS** backend designed to handle inbound guest messages across multiple channels (WhatsApp, Airbnb, Instagram, Booking.com, Direct). The system normalises messages into a unified schema, performs intelligent intent classification, delegates reply generation to Claude (Anthropic AI), and returns the drafted response alongside a calculated confidence score.
 
-Designed with **MVC architecture** and **modular microservice patterns**, the system ensures maintainability, separation of concerns, and high scalability.
+Designed with **MVC architecture**, **modular microservice patterns**, **Dockerized multi-replica deployment**, and **dual-layer rate limiting** for true production-readiness.
 
 ---
 
-## 1. Setup & Installation
+## 1. Quick Start
 
-Follow these steps to run the application locally:
+### Option A — Docker 
+
+> Requires Docker & Docker Compose installed.
 
 ```bash
-# 1. Install dependencies
-npm install
+# 1. Clone the repository and enter the directory
+git clone <repo-url>
+cd nistula-technical-assessment
 
-# 2. Configure environment variables
-# Create a .env file in the root directory and add:
-ANTHROPIC_API_KEY=sk-ant-your-api-key-here
+# 2. Ensure your .env file exists with a valid API key
+#    (the .env is already present with a valid key)
+ANTHROPIC_API_KEY=sk-ant-api03-xxxxxxxxxx
 PORT=3000
 
-# 3. Start the development server (clears port 3000 first to prevent EADDRINUSE errors)
-lsof -ti :3000 | xargs kill -9 2>/dev/null; npx ts-node-dev --respawn --transpile-only src/main.ts
+# 3. Build images and start all services (2 app replicas + Nginx)
+docker compose up --build -d
+
+# 4. Verify all containers are healthy
+docker compose ps
+```
+
+The API will be available at **`http://localhost/webhook/message`** (via Nginx on port 80).
+
+### Option B — Local Development
+
+```bash
+# Install dependencies
+npm install
+
+# Start the development server (auto-restart on file change)
+npx ts-node-dev --respawn --transpile-only src/main.ts
 ```
 
 The server will be available at `http://localhost:3000`.
@@ -29,87 +47,277 @@ The server will be available at `http://localhost:3000`.
 
 ## 2. Backend Architecture
 
-This application is built using **NestJS**, adhering to the **Model-View-Controller (MVC)** design pattern within a modular architecture. Rather than a tightly-coupled monolith, the codebase is structured around feature modules, making it trivial to extract components into independent microservices in the future.
+### High-Level Overview
 
-### Core Structure
+```
+                        ┌─────────────────────────────────────────┐
+                        │            DOCKER NETWORK               │
+                        │                                         │
+ ┌──────────┐  :80      │  ┌───────────────────────────────────┐  │
+ │  Client  │──────────►│  │    Nginx Reverse Proxy / LB       │  │
+ └──────────┘           │  │   (Rate Limit: 30 rps, burst 10)  │  │
+                        │  └─────────────┬─────────────────────┘  │
+                        │               │ least_conn              │
+                        │       ┌───────┴───────┐                 │
+                        │       ▼               ▼                 │
+                        │  ┌─────────┐    ┌─────────┐            │
+                        │  │  app1   │    │  app2   │            │
+                        │  │ :3000   │    │ :3000   │            │
+                        │  │NestJS   │    │NestJS   │            │
+                        │  │Throttle │    │Throttle │            │
+                        │  │20rpm/IP │    │20rpm/IP │            │
+                        │  └─────────┘    └─────────┘            │
+                        └─────────────────────────────────────────┘
+```
 
-```text
+### Source Code Structure
+
+```
 src/
-├── main.ts                          # Bootstrap & global configurations
-├── app.module.ts                    # Root module integrating sub-modules
+├── main.ts                          # Bootstrap & global ValidationPipe
+├── app.module.ts                    # Root module — ThrottlerModule + WebhooksModule + AiModule
 ├── webhooks/                        # ➔ WEBHOOKS MODULE
-│   ├── webhooks.module.ts           # Binds controllers and services
-│   ├── webhooks.controller.ts       # (Controller) Handles HTTP requests/routing
-│   ├── webhooks.service.ts          # (Service) Data normalisation & classification
-│   └── dto/                         # (Data Transfer Objects) Strict typing & validation
+│   ├── webhooks.module.ts           # Binds controller and service
+│   ├── webhooks.controller.ts       # HTTP routing (POST /message, GET /health)
+│   ├── webhooks.service.ts          # Normalisation & weighted classification engine
+│   └── dto/                         # Strict typing & validation
 │       ├── webhook.dto.ts           # Inbound payload schema
-│       └── unifiedmsg.dto.ts        # Internal unified schema
+│       ├── unifiedmsg.dto.ts        # Internal unified schema
+│       ├── ai-response.dto.ts       # Outbound response schema
+│       ├── query-type.enum.ts       # Intent categories
+│       ├── action.enum.ts           # auto_send | agent_review | escalate
+│       └── meesage-source.enum.ts   # Supported channels
 └── ai/                              # ➔ AI MODULE
-    ├── ai.module.ts                 
-    └── ai.service.ts                # (Service) Claude AI client & confidence logic
+    ├── ai.module.ts
+    └── ai.service.ts                # Claude API client, confidence scoring, action resolution
 ```
 
-- **Controllers:** Handle HTTP traffic, delegating business logic immediately to services.
-- **Services:** Contain the core business logic (classification, AI interaction).
-- **DTOs:** Utilise `class-validator` to strictly type-check inbound JSON payloads to ensure data integrity before any logic runs.
+### Infrastructure Files
+
+```
+nistula-technical-assessment/
+├── Dockerfile             # Multi-stage build (builder → runner, non-root user)
+├── docker-compose.yml     # Orchestrates app1 + app2 + nginx
+├── .dockerignore          # Excludes secrets, test files, git history from image
+└── nginx/
+    └── nginx.conf         # Upstream, rate limit zone, proxy config
+```
 
 ---
 
-## 3. Query Classification Logic
+## 3. Dockerization
 
-We abandoned brittle "first-match" string checking in favour of a **weighted multi-signal scoring system**. 
+### Multi-Stage Dockerfile
 
-### How it works:
-1. Every supported query type (`PRE_SALES_AVAILABILITY`, `POST_SALES_CHECKIN`, `SPECIAL_REQUEST`, etc.) contains a dictionary of keywords and phrases.
-2. Each keyword is assigned a **weight** based on its importance (e.g., `"not working"` is 10 points for a complaint, while `"book"` is only 2 points for availability).
-3. The system scans the message, sums up the matching weights for all categories, and assigns the message to the category with the highest cumulative score.
-4. **Tie-Breaking:** If there is a tie, `COMPLAINT` always takes priority to ensure urgent issues are never missed.
+| Stage | Base Image | Purpose |
+|---|---|---|
+| **builder** | `node:22-alpine` | Install all deps, compile TypeScript → `dist/` |
+| **runner** | `node:22-alpine` | Install only production deps, copy `dist/`, run as non-root |
+
+Key security practices:
+- Non-root user (`nistula`) runs the process.
+- `ANTHROPIC_API_KEY` is **never baked into the image** — injected at `docker compose up` from `.env`.
+- `HEALTHCHECK` built into the Dockerfile pings `/webhook/health` every 30s.
+
+### Scaling Horizontally
+
+To add more replicas beyond the default 2:
+
+```bash
+# Run with 4 replicas (remove container_name from compose to allow scaling)
+docker compose up --scale app1=4 -d
+```
+
+Or simply duplicate the `app3`, `app4` service blocks in `docker-compose.yml` and add them to the Nginx upstream.
 
 ---
 
-## 4. Confidence Scoring Engine
+## 4. Load Balancer (Nginx)
 
-Before returning an AI-drafted reply, the system evaluates how trustworthy the AI's response is using a mathematically rigid Confidence Engine.
+Nginx runs as the **sole public-facing entry point** on port `80`, protecting the NestJS apps from being directly exposed.
 
-### The Four Multiplicative Factors
-```text
-Confidence Score = BASE × CONTEXT × LENGTH × CHANNEL
+| Setting | Value |
+|---|---|
+| **Strategy** | `least_conn` — routes to the replica with fewest active connections |
+| **Keepalive** | 32 persistent connections to each upstream |
+| **Timeouts** | Read 30s, Connect 5s |
+| **Security headers** | `X-Frame-Options`, `X-Content-Type-Options`, `X-XSS-Protection` |
+| **Forwarded headers** | `X-Real-IP`, `X-Forwarded-For` passed to NestJS |
+| **Health endpoint** | `GET /webhook/health` — bypasses rate limit, used by Nginx upstream checks |
+
+---
+
+## 5. Rate Limiting (Dual-Layer)
+
+The system enforces rate limits at **two independent layers** for defence in depth:
+
+### Layer 1 — Nginx (Network Edge)
+
+```nginx
+limit_req_zone $binary_remote_addr zone=webhook_limit:10m rate=30r/s;
+limit_req zone=webhook_limit burst=10 nodelay;
 ```
 
-1. **Base Score:** How reliably can the AI answer this query type? (e.g., Pricing = `0.95`, Complaints = `0.40`).
-2. **Context Factor:** Does the message have a `booking_ref`? Confirmed guests provide more context (`1.00`). Pre-sales enquiries naturally don't have references, so they are not unfairly penalized (`0.95`).
-3. **Length Factor:** Is the message detailed enough? Messages under 15 characters are heavily penalized (`0.75`), while normal conversational queries (≥20 chars) are trusted (`1.00`).
-4. **Channel Factor:** Instagram messages are often casual or emoji-heavy, receiving a slight noise penalty (`0.95`). Standard channels like WhatsApp receive `1.00`.
+| Setting | Value |
+|---|---|
+| **Rate** | 30 requests/second per client IP |
+| **Burst** | 10 extra requests processed immediately before 429 is returned |
+| **HTTP status on reject** | `429 Too Many Requests` |
+| **Scope** | All `/webhook/` routes (health endpoint exempt) |
 
-### Strict Safety Floors & Property Validation
+### Layer 2 — NestJS ThrottlerModule (Application Layer)
 
-To prevent the AI from making unauthorized promises or hallucinating, we implemented hard boundaries:
-- **Unknown Properties:** If the inbound `property_id` is anything other than the supported `"villa-b1"`, the system bypasses the API call, drops the confidence score to **`0.0`**, and forces an escalation. The AI will never hallucinate data for an unsupported property.
-- **Complaints:** Always force `escalate`, regardless of confidence score.
-- **Special Requests:** Always capped at `agent_review`. They will never automatically send, ensuring a human always confirms custom requests like chef bookings or late check-outs.
+```typescript
+ThrottlerModule.forRoot([{ name: 'short', ttl: 60000, limit: 20 }])
+```
+
+| Setting | Value |
+|---|---|
+| **Rate** | 20 requests per 60-second window per client IP |
+| **HTTP status on reject** | `429 Too Many Requests` |
+| **Scope** | All controllers globally (health endpoint decorated with `@SkipThrottle()`) |
+| **Guard** | `APP_GUARD` — applied before any controller logic runs |
+
+### Why Two Layers?
+
+- Nginx catches volumetric abuse (DDoS, scrapers) before it reaches Node.js.
+- NestJS Throttler handles per-user API fairness in a way that Nginx cannot (e.g. future auth-based quotas).
+
+---
+
+## 6. Cross-Module Workflow & Scalability
+
+### Full Request Lifecycle
+
+```
+ 1. CLIENT sends POST /webhook/message
+         │
+         ▼
+ 2. NGINX (port 80)
+    - Applies rate limit zone (30 rps / IP, burst 10)
+    - If limit exceeded → 429 immediately (Node.js never touched)
+    - Selects least-loaded replica via least_conn
+    - Forwards request with X-Real-IP, X-Forwarded-For headers
+         │
+         ▼
+ 3. NESTJS APP (app1 or app2, port 3000)
+    │
+    ├─ [ThrottlerGuard] Checks per-IP request count in memory window
+    │   - If limit exceeded (>20/min) → 429 before controller reached
+    │
+    ├─ [ValidationPipe] Deserialises body into WebhookDto
+    │   - Validates: source enum, non-empty strings, ISO8601 timestamp
+    │   - If invalid → 400 Bad Request with field-level errors
+    │
+    └─ [WebhooksController] POST /webhook/message handler
+              │
+              ▼
+ 4. WebhooksService.normalise()
+    - Generates UUID message_id
+    - Maps inbound DTO → UnifiedMessageDto
+    - Calls classifyQuery() → Weighted scoring across 6 intent categories
+    - Returns QueryType with highest cumulative score
+    - Tie → COMPLAINT wins (safety-first)
+              │
+              ▼
+ 5. AiService.InteractWithAI()
+    │
+    ├─ computeConfidence()
+    │   - property_id !== 'villa-b1' → 0.0 (short-circuit)
+    │   - BASE score × CONTEXT factor × LENGTH factor × CHANNEL factor
+    │   - Returns final float [0.0, 1.0]
+    │
+    ├─ resolveAction()
+    │   - score 0.0       → ESCALATE
+    │   - COMPLAINT       → ESCALATE (always)
+    │   - score ≥ 0.85    → AUTO_SEND
+    │   - score ≥ 0.60    → AGENT_REVIEW
+    │   - SPECIAL_REQUEST → capped at AGENT_REVIEW
+    │   - score < 0.60    → ESCALATE
+    │
+    └─ Anthropic Claude API call
+        - Strict system prompt with property data sheet
+        - Draft ≤ 120 words, warm tone, factual only
+        - On API failure → InternalServerErrorException (safe fallback)
+              │
+              ▼
+ 6. Response returned to client
+    {
+      message_id, query_type, drafted_reply,
+      confidence_score, action
+    }
+```
+
+### Scalability Properties
+
+| Concern | Implementation |
+|---|---|
+| **Horizontal scaling** | Stateless NestJS instances — add replicas without code changes |
+| **No shared state** | Each replica independently validates, classifies, and calls Anthropic |
+| **Load distribution** | Nginx `least_conn` prevents hot-spotting under uneven load |
+| **Rate limiting state** | Nginx zone in shared memory (across workers); NestJS in-process per replica |
+| **Fault tolerance** | Docker `restart: unless-stopped`; Nginx waits for healthy replicas before starting |
+| **Container security** | Non-root process; API keys injected via env, never in image layers |
+| **Future DB/cache** | Redis can replace NestJS in-memory throttler for cross-replica consistency |
+
+---
+
+## 7. Query Classification Logic
+
+A **weighted multi-signal scoring system** — not brittle first-match string checking.
+
+1. Every intent category (`PRE_SALES_AVAILABILITY`, `COMPLAINT`, `SPECIAL_REQUEST`, etc.) has a dictionary of terms with assigned weights.
+2. The system scans the message text (lowercased), sums matching weights for all categories.
+3. The category with the **highest cumulative score** wins.
+4. **Tie-breaking:** `COMPLAINT` always wins to ensure urgent issues are never missed.
+
+---
+
+## 8. Confidence Scoring Engine
+
+```
+Confidence = BASE × CONTEXT × LENGTH × CHANNEL
+```
+
+| Factor | Description |
+|---|---|
+| **Base** | Reliability per query type (Pricing=0.95, Complaints=0.40) |
+| **Context** | `booking_ref` present? Confirmed guests = 1.0; pre-sales = 0.95; no ref = 0.75 |
+| **Length** | Message < 15 chars = 0.75; < 20 chars = 0.90; ≥ 20 chars = 1.0 |
+| **Channel** | Instagram casual noise = 0.95; all other channels = 1.0 |
 
 ### Action Thresholds
 
-| Score Range     | Action         | Meaning                                         |
-|-----------------|----------------|-------------------------------------------------|
-| ≥ 0.85          | `auto_send`    | Highly confident; safe to send to guest         |
-| 0.60 – 0.84     | `agent_review` | Moderate confidence; needs human approval       |
-| < 0.60          | `escalate`     | Low confidence or safety-flagged; human routing |
+| Score | Action | Meaning |
+|---|---|---|
+| ≥ 0.85 | `auto_send` | High confidence — safe to send automatically |
+| 0.60–0.84 | `agent_review` | Moderate — human approval needed |
+| < 0.60 | `escalate` | Low confidence or safety flag — human routing |
+
+### Hard Safety Rules
+
+- **Unknown property_id** → confidence drops to `0.0`, action forced to `escalate`. AI never hallucates data for unsupported properties.
+- **`COMPLAINT`** → always `escalate`, regardless of score.
+- **`SPECIAL_REQUEST`** → capped at `agent_review`. A human always confirms custom requests.
 
 ---
 
-## 5. Claude AI Integration
+## 9. Claude AI Integration
 
-The `AiService` integrates directly with the Anthropic API (using `claude-sonnet-4-20250514`). 
+The `AiService` uses **`claude-sonnet-4-20250514`** (Anthropic SDK).
 
 **Prompt Engineering:**
-The system uses strict contextual framing. The prompt injects the property's static data sheet, ensuring Claude only uses factual data. It enforces tone rules (warm, first-name basis) and length constraints (≤ 120 words). For complaints, the AI is explicitly instructed to show empathy and promise a follow-up, but *never* offer a direct resolution or refund.
+- System prompt injects the property's static data sheet — Claude only uses factual data.
+- Enforces tone rules (warm, first-name basis, ≤ 120 words).
+- Complaints: empathy + follow-up promise — never direct resolution or refund.
+- User prompt injects message, channel, booking reference, and classified intent category.
 
 ---
 
-## Example Payload & Response
+## 10. Example Payload & Response
 
 ### Inbound `POST /webhook/message`
+
 ```json
 {
   "source": "direct",
@@ -122,26 +330,47 @@ The system uses strict contextual framing. The prompt injects the property's sta
 ```
 
 ### Outbound Response
+
 ```json
 {
-    "message_id": "f5a23a2e-16a7-474c-a7be-217ef2e21ef1",
-    "query_type": "complaint",
-    "drafted_reply": "Hi Arjun,\n\nI'm so sorry to hear about the AC issue and that you haven't been able to reach anyone for assistance. This is absolutely not the experience we want for you at Villa B1, and I sincerely apologise for the inconvenience.\n\nI'm immediately escalating this to our property management team and caretaker to get the AC fixed as a priority. Someone will be in touch with you within the next 30 minutes to resolve this issue.\n\nThank you for bringing this to our attention, and again, I'm truly sorry for the trouble.\n\nWe'll make sure this gets sorted out right away for you!\n\nWarm regards,\nNistula Villas Team",
-    "confidence_score": 0.4,
-    "action": "escalate"
+  "message_id": "f5a23a2e-16a7-474c-a7be-217ef2e21ef1",
+  "query_type": "complaint",
+  "drafted_reply": "Hi Arjun,\n\nI'm so sorry to hear about the AC issue...",
+  "confidence_score": 0.4,
+  "action": "escalate"
 }
 ```
 
 ---
 
-## 6. Validation & Error Handling
+## 11. Validation & Error Handling
 
-The system uses `class-validator` DTO validation to ensure all inbound webhook payloads are structurally correct before processing.
-### Examples:
-- Invalid source platform → `400 Bad Request`
-- Empty message body → `400 Bad Request`
-- Unsupported property → graceful escalation flow
-- Claude API failure → safe fallback response
+| Scenario | Response |
+|---|---|
+| Invalid `source` platform | `400 Bad Request` |
+| Empty `message` body | `400 Bad Request` |
+| Non-ISO8601 `timestamp` | `400 Bad Request` |
+| Unsupported `property_id` | `200 OK` — `confidence: 0.0, action: escalate` |
+| Claude API failure | `500 Internal Server Error` |
+| Rate limit exceeded (Nginx) | `429 Too Many Requests` |
+| Rate limit exceeded (NestJS) | `429 Too Many Requests` |
 
-This ensures the system remains resilient even under malformed or incomplete requests.
+---
 
+## 12. Endpoints
+
+| Method | Path | Description | Auth |
+|---|---|---|---|
+| `POST` | `/webhook/message` | Process a guest message | None (rate limited) |
+| `GET` | `/webhook/health` | Health check for load balancer | None (throttle exempt) |
+
+---
+
+## 13. Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | ✅ Yes | Your Anthropic API key for Claude access |
+| `PORT` | ❌ No | Port for the NestJS server (default: `3000`) |
+
+For Docker deployments, these are read from the `.env` file in the project root by `docker compose`.

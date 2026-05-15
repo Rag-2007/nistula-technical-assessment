@@ -1,0 +1,12 @@
+node_modules
+.git
+.gitignore
+.env
+*.spec.ts
+*.md
+dist
+.DS_Store
+Icon
+thinking.md
+nistula_schema.png
+schema.sql
