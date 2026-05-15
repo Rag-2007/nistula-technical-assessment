@@ -49,7 +49,7 @@ The server will be available at `http://localhost:3000`.
 
 ### High-Level Overview
 
-```
+```text
                         ┌─────────────────────────────────────────┐
                         │            DOCKER NETWORK               │
                         │                                         │
@@ -57,18 +57,26 @@ The server will be available at `http://localhost:3000`.
  │  Client  │──────────►│  │    Nginx Reverse Proxy / LB       │  │
  └──────────┘           │  │   (Rate Limit: 30 rps, burst 10)  │  │
                         │  └─────────────┬─────────────────────┘  │
-                        │               │ least_conn              │
-                        │       ┌───────┴───────┐                 │
-                        │       ▼               ▼                 │
-                        │  ┌─────────┐    ┌─────────┐            │
-                        │  │  app1   │    │  app2   │            │
-                        │  │ :3000   │    │ :3000   │            │
-                        │  │NestJS   │    │NestJS   │            │
-                        │  │Throttle │    │Throttle │            │
-                        │  │20rpm/IP │    │20rpm/IP │            │
-                        │  └─────────┘    └─────────┘            │
+                        │                │ least_conn             │
+                        │        ┌───────┴───────┐                │
+                        │        ▼               ▼                │
+                        │   ┌─────────┐     ┌─────────┐           │
+                        │   │  app1   │     │  app2   │           │
+                        │   │ :3000   │     │ :3000   │           │
+                        │   │NestJS   │     │NestJS   │           │
+                        │   │Throttle │     │Throttle │           │
+                        │   │20rpm/IP │     │20rpm/IP │           │
+                        │   └─────────┘     └─────────┘           │
                         └─────────────────────────────────────────┘
 ```
+
+**Infrastructure Components:**
+
+- **Dockerized Microservice Architecture:** Runs inside an isolated, non-root Docker network. Ultra-lean multi-stage Alpine images ensure maximum security and scalable horizontal deployment without exposing environment secrets.
+- **Nginx Edge Load Balancer:** Functions as the resilient public gateway on port `80`. It routes traffic dynamically to the least busy NestJS container (`least_conn`) and monitors upstream health to provide zero-downtime availability.
+- **Dual-Layer Rate Limiting (Defense-in-Depth):**
+  - **Edge (Nginx):** Thwarts volumetric attacks (DDoS) immediately by capping clients at 30 req/sec.
+  - **App (NestJS):** The `@nestjs/throttler` guarantees API fairness, capping unique IPs to 20 requests per minute with built-in exemptions for system health checks.
 
 ### Source Code Structure
 
@@ -105,87 +113,7 @@ nistula-technical-assessment/
 
 ---
 
-## 3. Dockerization
-
-### Multi-Stage Dockerfile
-
-| Stage | Base Image | Purpose |
-|---|---|---|
-| **builder** | `node:22-alpine` | Install all deps, compile TypeScript → `dist/` |
-| **runner** | `node:22-alpine` | Install only production deps, copy `dist/`, run as non-root |
-
-Key security practices:
-- Non-root user (`nistula`) runs the process.
-- `ANTHROPIC_API_KEY` is **never baked into the image** — injected at `docker compose up` from `.env`.
-- `HEALTHCHECK` built into the Dockerfile pings `/webhook/health` every 30s.
-
-### Scaling Horizontally
-
-To add more replicas beyond the default 2:
-
-```bash
-# Run with 4 replicas (remove container_name from compose to allow scaling)
-docker compose up --scale app1=4 -d
-```
-
-Or simply duplicate the `app3`, `app4` service blocks in `docker-compose.yml` and add them to the Nginx upstream.
-
----
-
-## 4. Load Balancer (Nginx)
-
-Nginx runs as the **sole public-facing entry point** on port `80`, protecting the NestJS apps from being directly exposed.
-
-| Setting | Value |
-|---|---|
-| **Strategy** | `least_conn` — routes to the replica with fewest active connections |
-| **Keepalive** | 32 persistent connections to each upstream |
-| **Timeouts** | Read 30s, Connect 5s |
-| **Security headers** | `X-Frame-Options`, `X-Content-Type-Options`, `X-XSS-Protection` |
-| **Forwarded headers** | `X-Real-IP`, `X-Forwarded-For` passed to NestJS |
-| **Health endpoint** | `GET /webhook/health` — bypasses rate limit, used by Nginx upstream checks |
-
----
-
-## 5. Rate Limiting (Dual-Layer)
-
-The system enforces rate limits at **two independent layers** for defence in depth:
-
-### Layer 1 — Nginx (Network Edge)
-
-```nginx
-limit_req_zone $binary_remote_addr zone=webhook_limit:10m rate=30r/s;
-limit_req zone=webhook_limit burst=10 nodelay;
-```
-
-| Setting | Value |
-|---|---|
-| **Rate** | 30 requests/second per client IP |
-| **Burst** | 10 extra requests processed immediately before 429 is returned |
-| **HTTP status on reject** | `429 Too Many Requests` |
-| **Scope** | All `/webhook/` routes (health endpoint exempt) |
-
-### Layer 2 — NestJS ThrottlerModule (Application Layer)
-
-```typescript
-ThrottlerModule.forRoot([{ name: 'short', ttl: 60000, limit: 20 }])
-```
-
-| Setting | Value |
-|---|---|
-| **Rate** | 20 requests per 60-second window per client IP |
-| **HTTP status on reject** | `429 Too Many Requests` |
-| **Scope** | All controllers globally (health endpoint decorated with `@SkipThrottle()`) |
-| **Guard** | `APP_GUARD` — applied before any controller logic runs |
-
-### Why Two Layers?
-
-- Nginx catches volumetric abuse (DDoS, scrapers) before it reaches Node.js.
-- NestJS Throttler handles per-user API fairness in a way that Nginx cannot (e.g. future auth-based quotas).
-
----
-
-## 6. Cross-Module Workflow & Scalability
+## 3. Cross-Module Workflow & Scalability
 
 ### Full Request Lifecycle
 
@@ -262,7 +190,7 @@ ThrottlerModule.forRoot([{ name: 'short', ttl: 60000, limit: 20 }])
 
 ---
 
-## 7. Query Classification Logic
+## 4. Query Classification Logic
 
 A **weighted multi-signal scoring system** — not brittle first-match string checking.
 
@@ -273,7 +201,7 @@ A **weighted multi-signal scoring system** — not brittle first-match string ch
 
 ---
 
-## 8. Confidence Scoring Engine
+## 5. Confidence Scoring Engine
 
 ```
 Confidence = BASE × CONTEXT × LENGTH × CHANNEL
@@ -302,7 +230,7 @@ Confidence = BASE × CONTEXT × LENGTH × CHANNEL
 
 ---
 
-## 9. Claude AI Integration
+## 6. Claude AI Integration
 
 The `AiService` uses **`claude-sonnet-4-20250514`** (Anthropic SDK).
 
@@ -314,7 +242,7 @@ The `AiService` uses **`claude-sonnet-4-20250514`** (Anthropic SDK).
 
 ---
 
-## 10. Example Payload & Response
+## 7. Example Payload & Response
 
 ### Inbound `POST /webhook/message`
 
@@ -343,7 +271,7 @@ The `AiService` uses **`claude-sonnet-4-20250514`** (Anthropic SDK).
 
 ---
 
-## 11. Validation & Error Handling
+## 8. Validation & Error Handling
 
 | Scenario | Response |
 |---|---|
@@ -357,7 +285,7 @@ The `AiService` uses **`claude-sonnet-4-20250514`** (Anthropic SDK).
 
 ---
 
-## 12. Endpoints
+## 9. Endpoints
 
 | Method | Path | Description | Auth |
 |---|---|---|---|
@@ -366,7 +294,7 @@ The `AiService` uses **`claude-sonnet-4-20250514`** (Anthropic SDK).
 
 ---
 
-## 13. Environment Variables
+## 10. Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
